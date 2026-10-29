@@ -61,11 +61,57 @@ jobs:
              let finish_at = {
                  let host = env.objc.borrow::<MPMoviePlayerControllerHostObject>(player);
                  let end = effective_end_time(host);
+        diff --git a/src/frameworks/opengles/eagl.rs b/src/frameworks/opengles/eagl.rs
+        index 9248b0b..f472e25 100644
+        --- a/src/frameworks/opengles/eagl.rs
+        +++ b/src/frameworks/opengles/eagl.rs
+        @@ -971,6 +971,10 @@ pub const CLASSES: ClassExports = objc_classes! {
+                 use std::sync::atomic::{AtomicU64, Ordering};
+                 static FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+                 let n = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        +        super::gles_guest::DIAG_FRAME.store(n, Ordering::Relaxed);
+        +        if super::gles_guest::diag_window() {
+        +            log!("GLTRACE ---- presentRenderbuffer frame {} ----", n);
+        +        }
+                 if matches!(n, 10 | 60 | 300 | 1800 | 3600 | 7200 | 18000 | 36000) {
+                     log!(
+                         "[EAGLContext presentRenderbuffer:] frame {} reached (render loop is alive)",
         diff --git a/src/frameworks/opengles/gles_guest.rs b/src/frameworks/opengles/gles_guest.rs
-        index bdf753f..79c5604 100644
+        index bdf753f..2100111 100644
         --- a/src/frameworks/opengles/gles_guest.rs
         +++ b/src/frameworks/opengles/gles_guest.rs
-        @@ -810,6 +810,20 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
+        @@ -16,6 +16,16 @@ use crate::window::DeviceFamily;
+         use crate::Environment;
+         use std::collections::HashMap;
+         use std::slice::from_raw_parts;
+        +
+        +/// Frame counter published by `presentRenderbuffer:` for the GLTRACE
+        +/// diagnostics below.
+        +pub static DIAG_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        +/// GLTRACE window: 4 frames out of every 120 (after the first 120), so a
+        +/// per-frame pattern such as flicker is captured without flooding the log.
+        +pub fn diag_window() -> bool {
+        +    let f = DIAG_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        +    f >= 120 && f % 120 < 4
+        +}
+         use touchHLE_gl_bindings::gles11::{
+             ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER_BINDING, WRITE_ONLY_OES,
+         };
+        @@ -738,6 +748,13 @@ fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
+                     );
+                 }
+             }
+        +    if diag_window() {
+        +        log!(
+        +            "GLTRACE f={} glScissor({}, {}, {}, {})",
+        +            DIAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        +            x, y, width, height
+        +        );
+        +    }
+             let factor = env.options.scale_hack.get() as GLsizei;
+             let (x, y) = (x * factor, y * factor);
+             let (width, height) = (width * factor, height * factor);
+        @@ -810,6 +827,20 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
                      );
                  }
              }
@@ -86,7 +132,91 @@ jobs:
              let factor = env.options.scale_hack.get() as GLsizei;
              // The scale hack only enlarges the EAGL drawable's renderbuffer, not the
              // framebuffer objects an app creates for itself. Scaling a viewport aimed
-        @@ -3551,6 +3565,10 @@ fn glRenderbufferStorageOES(
+        @@ -831,6 +862,13 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
+                 .framework_state
+                 .opengles
+                 .scale_hack_applies_to_viewport(thread);
+        +    if diag_window() {
+        +        log!(
+        +            "GLTRACE f={} glViewport({}, {}, {}, {}) scaled={}",
+        +            DIAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        +            x, y, width, height, apply_scale_hack
+        +        );
+        +    }
+             let (x, y, width, height) = if apply_scale_hack {
+                 (x * factor, y * factor, width * factor, height * factor)
+             } else {
+        @@ -2449,6 +2487,13 @@ fn glDrawElements(
+         }
+         
+         fn glClear(env: &mut Environment, mask: GLbitfield) {
+        +    if diag_window() {
+        +        log!(
+        +            "GLTRACE f={} glClear({:#x})",
+        +            DIAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        +            mask
+        +        );
+        +    }
+             {
+                 use std::sync::atomic::{AtomicBool, Ordering};
+                 static SEEN: AtomicBool = AtomicBool::new(false);
+        @@ -2683,6 +2728,13 @@ fn glReadPixels(
+             type_: GLenum,
+             pixels: MutVoidPtr,
+         ) {
+        +    if diag_window() {
+        +        log!(
+        +            "GLTRACE f={} glReadPixels({}, {}, {}x{})",
+        +            DIAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        +            x, y, width, height
+        +        );
+        +    }
+             with_ctx_and_mem(env, |gles, mem| {
+                 let pixels = {
+                     let pixel_count: GuestUSize = width.checked_mul(height).unwrap().try_into().unwrap();
+        @@ -3367,6 +3419,13 @@ fn glCopyTexImage2D(
+             height: GLsizei,
+             border: GLint,
+         ) {
+        +    if diag_window() {
+        +        log!(
+        +            "GLTRACE f={} glCopyTexImage2D(level={}, fmt={:#x}, x={}, y={}, {}x{})",
+        +            DIAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        +            level, internalformat, x, y, width, height
+        +        );
+        +    }
+             with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
+                 let bound_texture = current_bound_texture(gles, target);
+                 gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
+        @@ -3386,6 +3445,13 @@ fn glCopyTexSubImage2D(
+             width: GLsizei,
+             height: GLsizei,
+         ) {
+        +    if diag_window() {
+        +        log!(
+        +            "GLTRACE f={} glCopyTexSubImage2D(level={}, off=({}, {}), src=({}, {}), {}x{})",
+        +            DIAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        +            level, xoffset, yoffset, x, y, width, height
+        +        );
+        +    }
+             with_ctx_and_mem(env, |gles, _mem| unsafe {
+                 gles.CopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height)
+             })
+        @@ -3509,6 +3575,13 @@ fn glIsRenderbufferOES(env: &mut Environment, renderbuffer: GLuint) -> GLboolean
+             })
+         }
+         fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
+        +    if diag_window() {
+        +        log!(
+        +            "GLTRACE f={} glBindFramebuffer({})",
+        +            DIAG_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+        +            framebuffer
+        +        );
+        +    }
+             let thread = env.current_thread;
+             env.framework_state
+                 .opengles
+        @@ -3551,6 +3624,10 @@ fn glRenderbufferStorageOES(
              height: GLsizei,
          ) {
              let factor = env.options.scale_hack.get() as GLsizei;
@@ -97,14 +227,14 @@ jobs:
              let (width, height) = (width * factor, height * factor);
              with_ctx_and_mem(env, |gles, _mem| unsafe {
                  gles.RenderbufferStorageOES(target, internalformat, width, height)
-        @@ -3657,6 +3675,16 @@ fn glFramebufferTexture2DOES(
+        @@ -3657,6 +3734,16 @@ fn glFramebufferTexture2DOES(
                      .opengles
                      .set_colour_attachment_is_texture(thread, texture != 0);
              }
         +    {
         +        use std::sync::atomic::{AtomicU32, Ordering};
         +        static N: AtomicU32 = AtomicU32::new(0);
-        +        if N.fetch_add(1, Ordering::Relaxed) < 40 {
+        +        if N.fetch_add(1, Ordering::Relaxed) < 40 || diag_window() {
         +            log!(
         +                "FBTEX-DIAG glFramebufferTexture2D(target={:#x}, attachment={:#x}, texture={}, level={}) [first 40 only]",
         +                target, attachment, texture, level
