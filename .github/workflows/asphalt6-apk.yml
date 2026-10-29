@@ -1,0 +1,296 @@
+name: Build Asphalt 6 fill-screen APK
+
+# One-file build: this repository only needs THIS file. It downloads HyperHLE-Reborn
+# v1.2.5, applies the Asphalt 6 fill-screen patch (embedded below) and builds the
+# Android APK. Run it from the Actions tab -> "Build Asphalt 6 fill-screen APK" -> Run workflow.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout HyperHLE-Reborn v1.2.5
+      uses: actions/checkout@v4
+      with:
+        repository: KlugKlugTG/HyperHLE-Reborn
+        ref: v1.2.5
+        submodules: recursive
+        fetch-depth: 0
+        fetch-tags: true
+
+    - name: Apply Asphalt 6 fill-screen patch
+      run: |
+        cat > a6.patch <<'PATCH_END_MARKER'
+        diff --git a/OPTIONS_HELP.txt b/OPTIONS_HELP.txt
+        index 8ddfae0..ffacfac 100644
+        --- a/OPTIONS_HELP.txt
+        +++ b/OPTIONS_HELP.txt
+        @@ -28,6 +28,14 @@ View options:
+                 and it will automatically rotate the window, but some apps neglect to
+                 do this. These options may be useful in that case.
+         
+        +    --eagl-fill-screen / --no-eagl-fill-screen
+        +        For apps that lay themselves out from the screen size (e.g. Asphalt 6
+        +        on a 16:9 device profile such as iPod touch 5) but whose nib still
+        +        describes a 3.5-inch window. Makes the nib-loaded window and OpenGL ES
+        +        view fill the emulated screen, and gives plain OpenGL ES views the iOS
+        +        default pixel scale of 1.0 until the app asks for more, so the
+        +        rendered image fills the whole display instead of one corner.
+        +
+             --scale-hack=...
+                 Set a scaling factor for the window. touchHLE will attempt to run the
+                 app with an increased internal resolution. This is a hack and there's
+        diff --git a/src/frameworks/opengles/gles_guest.rs b/src/frameworks/opengles/gles_guest.rs
+        index bdf753f..79c5604 100644
+        --- a/src/frameworks/opengles/gles_guest.rs
+        +++ b/src/frameworks/opengles/gles_guest.rs
+        @@ -810,6 +810,20 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
+                     );
+                 }
+             }
+        +    {
+        +        use std::sync::atomic::{AtomicU32, Ordering};
+        +        static N: AtomicU32 = AtomicU32::new(0);
+        +        static LAST: std::sync::Mutex<(GLint, GLint, GLsizei, GLsizei)> =
+        +            std::sync::Mutex::new((-1, -1, -1, -1));
+        +        let mut last = LAST.lock().unwrap();
+        +        if *last != (x, y, width, height) && N.fetch_add(1, Ordering::Relaxed) < 60 {
+        +            *last = (x, y, width, height);
+        +            log!(
+        +                "VP-DIAG glViewport({}, {}, {}, {}) [first 60 changes only]",
+        +                x, y, width, height
+        +            );
+        +        }
+        +    }
+             let factor = env.options.scale_hack.get() as GLsizei;
+             // The scale hack only enlarges the EAGL drawable's renderbuffer, not the
+             // framebuffer objects an app creates for itself. Scaling a viewport aimed
+        @@ -3551,6 +3565,10 @@ fn glRenderbufferStorageOES(
+             height: GLsizei,
+         ) {
+             let factor = env.options.scale_hack.get() as GLsizei;
+        +    log!(
+        +        "RBSTORE-DIAG glRenderbufferStorage(format={:#x}, {}x{}) -> {}x{}",
+        +        internalformat, width, height, width * factor, height * factor
+        +    );
+             let (width, height) = (width * factor, height * factor);
+             with_ctx_and_mem(env, |gles, _mem| unsafe {
+                 gles.RenderbufferStorageOES(target, internalformat, width, height)
+        @@ -3657,6 +3675,16 @@ fn glFramebufferTexture2DOES(
+                     .opengles
+                     .set_colour_attachment_is_texture(thread, texture != 0);
+             }
+        +    {
+        +        use std::sync::atomic::{AtomicU32, Ordering};
+        +        static N: AtomicU32 = AtomicU32::new(0);
+        +        if N.fetch_add(1, Ordering::Relaxed) < 40 {
+        +            log!(
+        +                "FBTEX-DIAG glFramebufferTexture2D(target={:#x}, attachment={:#x}, texture={}, level={}) [first 40 only]",
+        +                target, attachment, texture, level
+        +            );
+        +        }
+        +    }
+             with_ctx_and_mem(env, |gles, _mem| unsafe {
+                 gles.FramebufferTexture2DOES(target, attachment, textarget, texture, level)
+             })
+        diff --git a/src/frameworks/uikit/ui_view.rs b/src/frameworks/uikit/ui_view.rs
+        index ac08066..6406c24 100644
+        --- a/src/frameworks/uikit/ui_view.rs
+        +++ b/src/frameworks/uikit/ui_view.rs
+        @@ -295,6 +295,21 @@ fn init_common(env: &mut Environment, this: id) -> id {
+                 let screen: id = msg_class![env; UIScreen mainScreen];
+                 msg![env; screen scale]
+             };
+        +    // `--eagl-fill-screen`: on iOS a plain CAEAGLLayer-backed view has a
+        +    // contentScaleFactor of 1.0 until the app opts in (OpenGL ES Programming
+        +    // Guide, "Supporting High-Resolution Displays"). Seeding it with the
+        +    // screen scale made non-retina-aware apps get a 2x renderbuffer while
+        +    // their glViewport stayed in points, drawing into one corner.
+        +    let screen_scale = if env.options.eagl_fill_screen {
+        +        let eagl_layer_class = env.objc.get_known_class("CAEAGLLayer", &mut env.mem);
+        +        if env.objc.class_is_subclass_of(layer_class, eagl_layer_class) {
+        +            1.0
+        +        } else {
+        +            screen_scale
+        +        }
+        +    } else {
+        +        screen_scale
+        +    };
+             env.objc
+                 .borrow_mut::<UIViewHostObject>(this)
+                 .content_scale_factor = screen_scale;
+        @@ -954,6 +969,29 @@ pub const CLASSES: ClassExports = objc_classes! {
+                     () = msg![env; this setCenter:forced_center];
+                 }
+         
+        +        if env.options.eagl_fill_screen
+        +            && (class_name == "UIWindow" || class_name.contains("EAGLView"))
+        +        {
+        +            let screen: id = msg_class![env; UIScreen mainScreen];
+        +            let screen_bounds: CGRect = msg![env; screen bounds];
+        +            let fill_bounds = CGRect {
+        +                origin: CGPoint { x: 0.0, y: 0.0 },
+        +                size: screen_bounds.size,
+        +            };
+        +            let fill_center = CGPoint {
+        +                x: screen_bounds.size.width / 2.0,
+        +                y: screen_bounds.size.height / 2.0,
+        +            };
+        +            log!(
+        +                "--eagl-fill-screen: {} {:?} bounds -> {:?}",
+        +                class_name,
+        +                this,
+        +                fill_bounds
+        +            );
+        +            () = msg![env; this setBounds:fill_bounds];
+        +            () = msg![env; this setCenter:fill_center];
+        +        }
+        +
+                 let final_frame: CGRect = msg![env; this frame];
+                 let user_int: bool = msg![env; this isUserInteractionEnabled];
+                 let hidden: bool = msg![env; this isHidden];
+        diff --git a/src/options.rs b/src/options.rs
+        index f742c01..ac652ea 100644
+        --- a/src/options.rs
+        +++ b/src/options.rs
+        @@ -119,6 +119,13 @@ pub struct Options {
+             /// keep working; enable per app in the options file.
+             pub ios_es2_direct_present: bool,
+             pub scale_hack: NonZeroU32,
+        +    /// `--eagl-fill-screen`: for apps that size themselves from
+        +    /// `[UIScreen bounds]` but whose nib still describes a 3.5" window/view
+        +    /// (e.g. Asphalt 6 on a 16:9 device profile). Makes nib-loaded `UIWindow`
+        +    /// and EAGL views take the screen's bounds, and gives plain
+        +    /// `CAEAGLLayer`-backed views the iOS default `contentsScale` of 1.0 until
+        +    /// the app opts in, so the renderbuffer matches the app's `glViewport`.
+        +    pub eagl_fill_screen: bool,
+             /// `--ui-scale=N`: resolution multiplier for UIKit/Core Animation UI
+             /// (app picker, in-game UIKit HUDs). Layer bitmaps and the compositor
+             /// framebuffer are rendered at N times their point size.
+        @@ -295,6 +302,7 @@ impl Default for Options {
+                     ios_version: None,
+                     ios_es2_direct_present: false,
+                     scale_hack: NonZeroU32::new(1).unwrap(),
+        +            eagl_fill_screen: false,
+                     ui_scale: NonZeroU32::new(2).unwrap(),
+                     analog_stick_tilt_controls: true,
+                     deadzone: 0.1,
+        @@ -467,6 +475,10 @@ impl Options {
+                         return Err("--screen-size= dimensions must be non-zero".to_string());
+                     }
+                     self.host_screen_size = Some((w, h));
+        +        } else if arg == "--eagl-fill-screen" {
+        +            self.eagl_fill_screen = true;
+        +        } else if arg == "--no-eagl-fill-screen" {
+        +            self.eagl_fill_screen = false;
+                 } else if let Some(value) = arg.strip_prefix("--scale-hack=") {
+                     self.scale_hack = value
+                         .parse()
+        diff --git a/touchHLE_default_options.txt b/touchHLE_default_options.txt
+        index 39f6a82..ae9ec95 100644
+        --- a/touchHLE_default_options.txt
+        +++ b/touchHLE_default_options.txt
+        @@ -142,6 +142,10 @@ com.gameloft.Shrek4Free: --landscape-left --button-to-touch=DPadDown,44,278 --bu
+         # DPad = left and right, A = Nitro, X = Brake, Start = Pause
+         com.gameloft.ASPHALT4: --button-to-touch=DPadLeft,30,300 --button-to-touch=DPadRight,300,300 --button-to-touch=A,298,385 --button-to-touch=X,230,425 --button-to-touch=Start,20,20
+         
+        +# Asphalt 6
+        +# Fill a 16:9 device profile (pick iPod touch 5 in the app picker settings)
+        +com.gameloft.Asphalt6: --eagl-fill-screen
+        +
+         # Asphalt 5
+         # A = Nitro, B = Brake, Start = Pause
+         com.gameloft.Asphalt5: --landscape-left --button-to-touch=A,415,295 --button-to-touch=B,60,300 --button-to-touch=Start,25,25
+        PATCH_END_MARKER
+        git apply --verbose a6.patch
+
+    - name: Try to get cached copy of Boost
+      id: cache-boost
+      uses: actions/cache@v4
+      with:
+        path: vendor/boost
+        key: boost_1_81_0
+
+    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+      name: Download Boost
+      run: curl -L -o boost_1_81_0.7z "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.7z"
+
+    - if: ${{ steps.cache-boost.outputs.cache-hit != 'true' }}
+      name: Extract Boost
+      run: 7z -ovendor x boost_1_81_0.7z && mv vendor/boost_1_81_0 vendor/boost
+
+    - name: Try to get cached copy of cmake
+      id: cache-cmake
+      uses: actions/cache@v4
+      with:
+        path: vendor/cmake
+        key: cmake_3_31_6_linux
+
+    - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+      name: Download Cmake
+      run: curl -L -O "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz"
+
+    - if: ${{ steps.cache-cmake.outputs.cache-hit != 'true' }}
+      name: Extract Cmake
+      run: tar xzf "cmake-3.31.6-linux-x86_64.tar.gz" -C vendor && mv vendor/cmake-3.31.6-linux-x86_64 vendor/cmake
+
+    - name: Install AArch64 Android Rust toolchain
+      run: rustup target add aarch64-linux-android
+
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk@3.5.4
+
+    - name: Try to get a cached copy of Gradle
+      id: cache-gradle
+      uses: actions/cache@v4
+      with:
+        path: gradle
+        key: gradle-8.11.1
+
+    - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}
+      name: Download Gradle
+      run: curl -L -o gradle-8.11.1-bin.zip "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip"
+
+    - if: ${{ steps.cache-gradle.outputs.cache-hit != 'true' }}
+      name: Extract Gradle
+      run: 7z -ogradle x gradle-8.11.1-bin.zip
+
+    - name: Try to get a cached copy of Android NDK
+      id: cache-android-ndk
+      uses: actions/cache@v4
+      with:
+        path: android-ndk
+        key: android-ndk-r25c
+
+    - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
+      name: Download Android NDK
+      run: curl -L -o android-ndk-r25c-linux.zip "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
+
+    - if: ${{ steps.cache-android-ndk.outputs.cache-hit != 'true' }}
+      name: Extract Android NDK
+      run: 7z -oandroid-ndk -snld x android-ndk-r25c-linux.zip
+
+    - name: Link Android NDK
+      run: ln -s $PWD/android-ndk/android-ndk-r25c $ANDROID_SDK_ROOT/ndk/25.2.9519653
+
+    - name: Generate local.properties file
+      run: echo "sdk.dir=$ANDROID_SDK_ROOT" > android/local.properties
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '17'
+
+    - name: Build for Android
+      run: cd android && ../gradle/gradle-8.11.1/bin/gradle assembleRelease && mv app/build/outputs/apk/release/HyperHLE-Reborn-release.apk ../HyperHLE-Reborn.apk
+      env:
+        ANDROID_NDK_ROOT: /usr/local/lib/android/sdk/ndk/25.2.9519653
+        CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: HyperHLE-Asphalt6-fill-screen-APK
+        path: HyperHLE-Reborn.apk
