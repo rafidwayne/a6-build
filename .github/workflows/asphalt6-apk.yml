@@ -24,24 +24,43 @@ jobs:
       run: |
         cat > a6.patch <<'PATCH_END_MARKER'
         diff --git a/OPTIONS_HELP.txt b/OPTIONS_HELP.txt
-        index 8ddfae0..ffacfac 100644
+        index 8ddfae0..61b560f 100644
         --- a/OPTIONS_HELP.txt
         +++ b/OPTIONS_HELP.txt
-        @@ -28,6 +28,14 @@ View options:
+        @@ -28,6 +28,20 @@ View options:
                  and it will automatically rotate the window, but some apps neglect to
                  do this. These options may be useful in that case.
          
         +    --eagl-fill-screen / --no-eagl-fill-screen
-        +        For apps that lay themselves out from the screen size (e.g. Asphalt 6
-        +        on a 16:9 device profile such as iPod touch 5) but whose nib still
-        +        describes a 3.5-inch window. Makes the nib-loaded window and OpenGL ES
-        +        view fill the emulated screen, and gives plain OpenGL ES views the iOS
-        +        default pixel scale of 1.0 until the app asks for more, so the
-        +        rendered image fills the whole display instead of one corner.
+        +        Makes the nib-loaded window and OpenGL ES view take the emulated
+        +        screen's size, for apps that lay themselves out from the screen size
+        +        (e.g. Asphalt 6 on a 16:9 device profile such as iPod touch 5) but
+        +        whose nib still describes a 3.5-inch window.
+        +
+        +    --eagl-default-scale-1 / --no-eagl-default-scale-1
+        +        Gives plain OpenGL ES views the iOS default pixel scale of 1.0 until
+        +        the app asks for more, instead of the screen's retina scale.
+        +
+        +    --skip-movies / --no-skip-movies
+        +        Videos played with MPMoviePlayerController finish almost immediately,
+        +        like a skip. For apps whose intro movies can't be skipped by tapping.
         +
              --scale-hack=...
                  Set a scaling factor for the window. touchHLE will attempt to run the
                  app with an increased internal resolution. This is a hack and there's
+        diff --git a/src/frameworks/media_player/movie_player.rs b/src/frameworks/media_player/movie_player.rs
+        index 2e4d2a3..ed7f734 100644
+        --- a/src/frameworks/media_player/movie_player.rs
+        +++ b/src/frameworks/media_player/movie_player.rs
+        @@ -717,6 +717,8 @@ fn schedule_playback_finish(
+             start_at: Instant,
+             use_media_duration: bool,
+         ) {
+        +    // `--skip-movies`: pretend the user skipped the movie straight away.
+        +    let use_media_duration = use_media_duration && !env.options.skip_movies;
+             let finish_at = {
+                 let host = env.objc.borrow::<MPMoviePlayerControllerHostObject>(player);
+                 let end = effective_end_time(host);
         diff --git a/src/frameworks/opengles/gles_guest.rs b/src/frameworks/opengles/gles_guest.rs
         index bdf753f..79c5604 100644
         --- a/src/frameworks/opengles/gles_guest.rs
@@ -96,19 +115,19 @@ jobs:
                  gles.FramebufferTexture2DOES(target, attachment, textarget, texture, level)
              })
         diff --git a/src/frameworks/uikit/ui_view.rs b/src/frameworks/uikit/ui_view.rs
-        index ac08066..6406c24 100644
+        index ac08066..e800960 100644
         --- a/src/frameworks/uikit/ui_view.rs
         +++ b/src/frameworks/uikit/ui_view.rs
         @@ -295,6 +295,21 @@ fn init_common(env: &mut Environment, this: id) -> id {
                  let screen: id = msg_class![env; UIScreen mainScreen];
                  msg![env; screen scale]
              };
-        +    // `--eagl-fill-screen`: on iOS a plain CAEAGLLayer-backed view has a
+        +    // `--eagl-default-scale-1`: on iOS a plain CAEAGLLayer-backed view has a
         +    // contentScaleFactor of 1.0 until the app opts in (OpenGL ES Programming
         +    // Guide, "Supporting High-Resolution Displays"). Seeding it with the
         +    // screen scale made non-retina-aware apps get a 2x renderbuffer while
         +    // their glViewport stayed in points, drawing into one corner.
-        +    let screen_scale = if env.options.eagl_fill_screen {
+        +    let screen_scale = if env.options.eagl_default_scale_1 {
         +        let eagl_layer_class = env.objc.get_known_class("CAEAGLLayer", &mut env.mem);
         +        if env.objc.class_is_subclass_of(layer_class, eagl_layer_class) {
         +            1.0
@@ -152,32 +171,41 @@ jobs:
                  let user_int: bool = msg![env; this isUserInteractionEnabled];
                  let hidden: bool = msg![env; this isHidden];
         diff --git a/src/options.rs b/src/options.rs
-        index f742c01..ac652ea 100644
+        index f742c01..b5a79f0 100644
         --- a/src/options.rs
         +++ b/src/options.rs
-        @@ -119,6 +119,13 @@ pub struct Options {
+        @@ -119,6 +119,20 @@ pub struct Options {
              /// keep working; enable per app in the options file.
              pub ios_es2_direct_present: bool,
              pub scale_hack: NonZeroU32,
         +    /// `--eagl-fill-screen`: for apps that size themselves from
-        +    /// `[UIScreen bounds]` but whose nib still describes a 3.5" window/view
+        +    /// `[UIScreen bounds]` but whose nib still describes a 3.5\" window/view
         +    /// (e.g. Asphalt 6 on a 16:9 device profile). Makes nib-loaded `UIWindow`
-        +    /// and EAGL views take the screen's bounds, and gives plain
-        +    /// `CAEAGLLayer`-backed views the iOS default `contentsScale` of 1.0 until
-        +    /// the app opts in, so the renderbuffer matches the app's `glViewport`.
+        +    /// and EAGL views take the screen's bounds.
         +    pub eagl_fill_screen: bool,
+        +    /// `--eagl-default-scale-1`: plain `CAEAGLLayer`-backed views start with
+        +    /// the iOS default `contentsScale` of 1.0 instead of the screen scale, so
+        +    /// apps that never opt in to retina get a renderbuffer that matches the
+        +    /// point-sized depth buffers and `glViewport` they use.
+        +    pub eagl_default_scale_1: bool,
+        +    /// `--skip-movies`: `MPMoviePlayerController` videos finish almost
+        +    /// immediately (as if the user skipped them), for apps whose intro movies
+        +    /// can't be skipped by tapping.
+        +    pub skip_movies: bool,
              /// `--ui-scale=N`: resolution multiplier for UIKit/Core Animation UI
              /// (app picker, in-game UIKit HUDs). Layer bitmaps and the compositor
              /// framebuffer are rendered at N times their point size.
-        @@ -295,6 +302,7 @@ impl Default for Options {
+        @@ -295,6 +309,9 @@ impl Default for Options {
                      ios_version: None,
                      ios_es2_direct_present: false,
                      scale_hack: NonZeroU32::new(1).unwrap(),
         +            eagl_fill_screen: false,
+        +            eagl_default_scale_1: false,
+        +            skip_movies: false,
                      ui_scale: NonZeroU32::new(2).unwrap(),
                      analog_stick_tilt_controls: true,
                      deadzone: 0.1,
-        @@ -467,6 +475,10 @@ impl Options {
+        @@ -467,6 +484,18 @@ impl Options {
                          return Err("--screen-size= dimensions must be non-zero".to_string());
                      }
                      self.host_screen_size = Some((w, h));
@@ -185,11 +213,19 @@ jobs:
         +            self.eagl_fill_screen = true;
         +        } else if arg == "--no-eagl-fill-screen" {
         +            self.eagl_fill_screen = false;
+        +        } else if arg == "--eagl-default-scale-1" {
+        +            self.eagl_default_scale_1 = true;
+        +        } else if arg == "--no-eagl-default-scale-1" {
+        +            self.eagl_default_scale_1 = false;
+        +        } else if arg == "--skip-movies" {
+        +            self.skip_movies = true;
+        +        } else if arg == "--no-skip-movies" {
+        +            self.skip_movies = false;
                  } else if let Some(value) = arg.strip_prefix("--scale-hack=") {
                      self.scale_hack = value
                          .parse()
         diff --git a/touchHLE_default_options.txt b/touchHLE_default_options.txt
-        index 39f6a82..ae9ec95 100644
+        index 39f6a82..f8e9bfd 100644
         --- a/touchHLE_default_options.txt
         +++ b/touchHLE_default_options.txt
         @@ -142,6 +142,10 @@ com.gameloft.Shrek4Free: --landscape-left --button-to-touch=DPadDown,44,278 --bu
@@ -198,7 +234,7 @@ jobs:
          
         +# Asphalt 6
         +# Fill a 16:9 device profile (pick iPod touch 5 in the app picker settings)
-        +com.gameloft.Asphalt6: --eagl-fill-screen
+        +com.gameloft.Asphalt6: --eagl-fill-screen --eagl-default-scale-1 --skip-movies
         +
          # Asphalt 5
          # A = Nitro, B = Brake, Start = Pause
