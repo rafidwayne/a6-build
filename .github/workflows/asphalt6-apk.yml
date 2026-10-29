@@ -1,4 +1,4 @@
-name: Build Asphalt 6 fill-screen APK
+name: Build Asphalt 6 fill-screen APK (v4 render-texture scaling)
 
 # One-file build: this repository only needs THIS file. It downloads HyperHLE-Reborn
 # v1.2.5, applies the Asphalt 6 fill-screen patch (embedded below) and builds the
@@ -24,10 +24,10 @@ jobs:
       run: |
         cat > a6.patch <<'PATCH_END_MARKER'
         diff --git a/OPTIONS_HELP.txt b/OPTIONS_HELP.txt
-        index 8ddfae0..61b560f 100644
+        index 8ddfae0..858b1ab 100644
         --- a/OPTIONS_HELP.txt
         +++ b/OPTIONS_HELP.txt
-        @@ -28,6 +28,20 @@ View options:
+        @@ -28,6 +28,26 @@ View options:
                  and it will automatically rotate the window, but some apps neglect to
                  do this. These options may be useful in that case.
          
@@ -40,6 +40,12 @@ jobs:
         +    --eagl-default-scale-1 / --no-eagl-default-scale-1
         +        Gives plain OpenGL ES views the iOS default pixel scale of 1.0 until
         +        the app asks for more, instead of the screen's retina scale.
+        +
+        +    --scale-hack-render-textures / --no-scale-hack-render-textures
+        +        With --scale-hack=N, also enlarges modest colour textures an app
+        +        renders into via a framebuffer object, and scales the viewport and
+        +        scissor while drawing into them, so offscreen passes (e.g. a game that
+        +        draws its 3D scene to a texture first) also get the higher resolution.
         +
         +    --skip-movies / --no-skip-movies
         +        Videos played with MPMoviePlayerController finish almost immediately,
@@ -77,13 +83,41 @@ jobs:
                      log!(
                          "[EAGLContext presentRenderbuffer:] frame {} reached (render loop is alive)",
         diff --git a/src/frameworks/opengles/gles_guest.rs b/src/frameworks/opengles/gles_guest.rs
-        index bdf753f..2100111 100644
+        index bdf753f..45aee54 100644
         --- a/src/frameworks/opengles/gles_guest.rs
         +++ b/src/frameworks/opengles/gles_guest.rs
-        @@ -16,6 +16,16 @@ use crate::window::DeviceFamily;
+        @@ -16,6 +16,44 @@ use crate::window::DeviceFamily;
          use crate::Environment;
          use std::collections::HashMap;
          use std::slice::from_raw_parts;
+        +
+        +/// What the guest last told us about a level-0 2D texture created with no
+        +/// pixel data (the usual way to make a render-to-texture target). Used by
+        +/// `--scale-hack-render-textures`.
+        +struct RtTexInfo {
+        +    width: GLsizei,
+        +    height: GLsizei,
+        +    internalformat: GLint,
+        +    format: GLenum,
+        +    type_: GLenum,
+        +    /// The host texture has been re-created at scale-hack size.
+        +    scaled: bool,
+        +}
+        +static RT_TEXTURES: std::sync::Mutex<Option<HashMap<GLuint, RtTexInfo>>> =
+        +    std::sync::Mutex::new(None);
+        +fn rt_with<R>(f: impl FnOnce(&mut HashMap<GLuint, RtTexInfo>) -> R) -> R {
+        +    let mut guard = RT_TEXTURES.lock().unwrap();
+        +    f(guard.get_or_insert_with(HashMap::new))
+        +}
+        +/// Only enlarge modest render targets; big ones (e.g. shadow maps) would cost
+        +/// far too much memory.
+        +fn rt_scalable(width: GLsizei, height: GLsizei, factor: GLsizei) -> bool {
+        +    factor > 1
+        +        && width > 0
+        +        && height > 0
+        +        && width.saturating_mul(factor) <= 2048
+        +        && height.saturating_mul(factor) <= 2048
+        +}
         +
         +/// Frame counter published by `presentRenderbuffer:` for the GLTRACE
         +/// diagnostics below.
@@ -97,7 +131,7 @@ jobs:
          use touchHLE_gl_bindings::gles11::{
              ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER_BINDING, WRITE_ONLY_OES,
          };
-        @@ -738,6 +748,13 @@ fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
+        @@ -738,6 +776,13 @@ fn glScissor(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
                      );
                  }
              }
@@ -111,7 +145,7 @@ jobs:
              let factor = env.options.scale_hack.get() as GLsizei;
              let (x, y) = (x * factor, y * factor);
              let (width, height) = (width * factor, height * factor);
-        @@ -810,6 +827,20 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
+        @@ -810,6 +855,20 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
                      );
                  }
              }
@@ -132,7 +166,7 @@ jobs:
              let factor = env.options.scale_hack.get() as GLsizei;
              // The scale hack only enlarges the EAGL drawable's renderbuffer, not the
              // framebuffer objects an app creates for itself. Scaling a viewport aimed
-        @@ -831,6 +862,13 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
+        @@ -831,6 +890,13 @@ fn glViewport(env: &mut Environment, x: GLint, y: GLint, width: GLsizei, height:
                  .framework_state
                  .opengles
                  .scale_hack_applies_to_viewport(thread);
@@ -146,7 +180,7 @@ jobs:
              let (x, y, width, height) = if apply_scale_hack {
                  (x * factor, y * factor, width * factor, height * factor)
              } else {
-        @@ -2449,6 +2487,13 @@ fn glDrawElements(
+        @@ -2449,6 +2515,13 @@ fn glDrawElements(
          }
          
          fn glClear(env: &mut Environment, mask: GLbitfield) {
@@ -160,7 +194,7 @@ jobs:
              {
                  use std::sync::atomic::{AtomicBool, Ordering};
                  static SEEN: AtomicBool = AtomicBool::new(false);
-        @@ -2683,6 +2728,13 @@ fn glReadPixels(
+        @@ -2683,6 +2756,13 @@ fn glReadPixels(
              type_: GLenum,
              pixels: MutVoidPtr,
          ) {
@@ -174,7 +208,79 @@ jobs:
              with_ctx_and_mem(env, |gles, mem| {
                  let pixels = {
                      let pixel_count: GuestUSize = width.checked_mul(height).unwrap().try_into().unwrap();
-        @@ -3367,6 +3419,13 @@ fn glCopyTexImage2D(
+        @@ -2721,6 +2801,9 @@ fn glDeleteTextures(env: &mut Environment, n: GLsizei, textures: ConstPtr<GLuint
+                 unsafe { gles.DeleteTextures(n, deleted.as_ptr()) };
+                 for texture in deleted {
+                     shadow.forget_pvrtc_texture(texture);
+        +            rt_with(|m| {
+        +                m.remove(&texture);
+        +            });
+                 }
+             })
+         }
+        @@ -3042,6 +3125,11 @@ fn glTexImage2D(
+             }
+             let guest_pixels = pixels;
+             let fix_filter = env.options.fix_texture_min_filter && level == 0;
+        +    let rt_scale: GLsizei = if env.options.scale_hack_render_textures {
+        +        env.options.scale_hack.get() as GLsizei
+        +    } else {
+        +        1
+        +    };
+             with_ctx_mem_and_shadow(env, |gles, mem, shadow| unsafe {
+                 let bound_texture = current_bound_texture(gles, target);
+                 let pixels = if pixels.is_null() {
+        @@ -3051,12 +3139,47 @@ fn glTexImage2D(
+                     let size = image_size_estimate(pixel_count, format, type_);
+                     mem.ptr_at(pixels.cast::<u8>(), size).cast::<GLvoid>()
+                 };
+        +        // `--scale-hack-render-textures`: remember render-target-style
+        +        // textures, and keep already-enlarged ones enlarged if the app
+        +        // re-specifies them.
+        +        let (tex_w, tex_h) = if rt_scale > 1 && target == gles11::TEXTURE_2D && level == 0 {
+        +            match bound_texture {
+        +                Some(tex) if tex != 0 => rt_with(|m| {
+        +                    if pixels.is_null() {
+        +                        let was_scaled = m.get(&tex).map_or(false, |i| i.scaled);
+        +                        let scale_it = was_scaled && rt_scalable(width, height, rt_scale);
+        +                        m.insert(
+        +                            tex,
+        +                            RtTexInfo {
+        +                                width,
+        +                                height,
+        +                                internalformat,
+        +                                format,
+        +                                type_,
+        +                                scaled: scale_it,
+        +                            },
+        +                        );
+        +                        if scale_it {
+        +                            (width * rt_scale, height * rt_scale)
+        +                        } else {
+        +                            (width, height)
+        +                        }
+        +                    } else {
+        +                        m.remove(&tex);
+        +                        (width, height)
+        +                    }
+        +                }),
+        +                _ => (width, height),
+        +            }
+        +        } else {
+        +            (width, height)
+        +        };
+                 gles.TexImage2D(
+                     target,
+                     level,
+                     internalformat,
+        -            width,
+        -            height,
+        +            tex_w,
+        +            tex_h,
+                     border,
+                     format,
+                     type_,
+        @@ -3367,6 +3490,13 @@ fn glCopyTexImage2D(
              height: GLsizei,
              border: GLint,
          ) {
@@ -188,7 +294,7 @@ jobs:
              with_ctx_mem_and_shadow(env, |gles, _mem, shadow| unsafe {
                  let bound_texture = current_bound_texture(gles, target);
                  gles.CopyTexImage2D(target, level, internalformat, x, y, width, height, border);
-        @@ -3386,6 +3445,13 @@ fn glCopyTexSubImage2D(
+        @@ -3386,6 +3516,13 @@ fn glCopyTexSubImage2D(
              width: GLsizei,
              height: GLsizei,
          ) {
@@ -202,7 +308,7 @@ jobs:
              with_ctx_and_mem(env, |gles, _mem| unsafe {
                  gles.CopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height)
              })
-        @@ -3509,6 +3575,13 @@ fn glIsRenderbufferOES(env: &mut Environment, renderbuffer: GLuint) -> GLboolean
+        @@ -3509,6 +3646,13 @@ fn glIsRenderbufferOES(env: &mut Environment, renderbuffer: GLuint) -> GLboolean
              })
          }
          fn glBindFramebufferOES(env: &mut Environment, target: GLenum, framebuffer: GLuint) {
@@ -216,7 +322,7 @@ jobs:
              let thread = env.current_thread;
              env.framework_state
                  .opengles
-        @@ -3551,6 +3624,10 @@ fn glRenderbufferStorageOES(
+        @@ -3551,6 +3695,10 @@ fn glRenderbufferStorageOES(
              height: GLsizei,
          ) {
              let factor = env.options.scale_hack.get() as GLsizei;
@@ -227,10 +333,74 @@ jobs:
              let (width, height) = (width * factor, height * factor);
              with_ctx_and_mem(env, |gles, _mem| unsafe {
                  gles.RenderbufferStorageOES(target, internalformat, width, height)
-        @@ -3657,6 +3734,16 @@ fn glFramebufferTexture2DOES(
+        @@ -3651,11 +3799,78 @@ fn glFramebufferTexture2DOES(
+             texture: GLuint,
+             level: i32,
+         ) {
+        +    // `--scale-hack-render-textures`: enlarge a render-target texture the
+        +    // first time it is attached as a framebuffer's colour buffer.
+        +    let rt_scale: GLsizei = if env.options.scale_hack_render_textures {
+        +        env.options.scale_hack.get() as GLsizei
+        +    } else {
+        +        1
+        +    };
+        +    let mut texture_scaled = false;
+        +    if rt_scale > 1
+        +        && attachment == gles11::COLOR_ATTACHMENT0_OES
+        +        && textarget == gles11::TEXTURE_2D
+        +        && level == 0
+        +        && texture != 0
+        +    {
+        +        let info = rt_with(|m| {
+        +            m.get(&texture)
+        +                .map(|i| (i.width, i.height, i.internalformat, i.format, i.type_, i.scaled))
+        +        });
+        +        if let Some((w, h, ifmt, fmt, ty, scaled)) = info {
+        +            if scaled {
+        +                texture_scaled = true;
+        +            } else if rt_scalable(w, h, rt_scale) && (fmt == 0x1908 || fmt == 0x1907) {
+        +                with_ctx_and_mem(env, |gles, _mem| unsafe {
+        +                    let prev = current_bound_texture(gles, gles11::TEXTURE_2D).unwrap_or(0);
+        +                    gles.BindTexture(gles11::TEXTURE_2D, texture);
+        +                    gles.TexImage2D(
+        +                        gles11::TEXTURE_2D,
+        +                        0,
+        +                        ifmt,
+        +                        w * rt_scale,
+        +                        h * rt_scale,
+        +                        0,
+        +                        fmt,
+        +                        ty,
+        +                        std::ptr::null(),
+        +                    );
+        +                    gles.BindTexture(gles11::TEXTURE_2D, prev);
+        +                });
+        +                rt_with(|m| {
+        +                    if let Some(i) = m.get_mut(&texture) {
+        +                        i.scaled = true;
+        +                    }
+        +                });
+        +                texture_scaled = true;
+        +                log!(
+        +                    "RTSCALE: render texture {} {}x{} -> {}x{}",
+        +                    texture,
+        +                    w,
+        +                    h,
+        +                    w * rt_scale,
+        +                    h * rt_scale
+        +                );
+        +            }
+        +        }
+        +    }
+             if attachment == gles11::COLOR_ATTACHMENT0_OES {
+                 let thread = env.current_thread;
+        +        // A scaled render texture is treated like the (scaled) drawable, so
+        +        // glViewport/glScissor get scaled while drawing into it.
+                 env.framework_state
                      .opengles
-                     .set_colour_attachment_is_texture(thread, texture != 0);
-             }
+        -            .set_colour_attachment_is_texture(thread, texture != 0);
+        +            .set_colour_attachment_is_texture(thread, texture != 0 && !texture_scaled);
+        +    }
         +    {
         +        use std::sync::atomic::{AtomicU32, Ordering};
         +        static N: AtomicU32 = AtomicU32::new(0);
@@ -240,10 +410,9 @@ jobs:
         +                target, attachment, texture, level
         +            );
         +        }
-        +    }
+             }
              with_ctx_and_mem(env, |gles, _mem| unsafe {
                  gles.FramebufferTexture2DOES(target, attachment, textarget, texture, level)
-             })
         diff --git a/src/frameworks/uikit/ui_view.rs b/src/frameworks/uikit/ui_view.rs
         index ac08066..e800960 100644
         --- a/src/frameworks/uikit/ui_view.rs
@@ -301,10 +470,10 @@ jobs:
                  let user_int: bool = msg![env; this isUserInteractionEnabled];
                  let hidden: bool = msg![env; this isHidden];
         diff --git a/src/options.rs b/src/options.rs
-        index f742c01..b5a79f0 100644
+        index f742c01..725bd1f 100644
         --- a/src/options.rs
         +++ b/src/options.rs
-        @@ -119,6 +119,20 @@ pub struct Options {
+        @@ -119,6 +119,26 @@ pub struct Options {
              /// keep working; enable per app in the options file.
              pub ios_es2_direct_present: bool,
              pub scale_hack: NonZeroU32,
@@ -322,20 +491,27 @@ jobs:
         +    /// immediately (as if the user skipped them), for apps whose intro movies
         +    /// can't be skipped by tapping.
         +    pub skip_movies: bool,
+        +    /// `--scale-hack-render-textures`: with `--scale-hack=N`, also enlarge
+        +    /// colour textures an app renders into through a framebuffer object
+        +    /// (render-to-texture), and scale the viewport/scissor used while drawing
+        +    /// into them. Without this such passes (e.g. a game drawing its 3D scene
+        +    /// to an offscreen texture) stay at the app's native resolution.
+        +    pub scale_hack_render_textures: bool,
              /// `--ui-scale=N`: resolution multiplier for UIKit/Core Animation UI
              /// (app picker, in-game UIKit HUDs). Layer bitmaps and the compositor
              /// framebuffer are rendered at N times their point size.
-        @@ -295,6 +309,9 @@ impl Default for Options {
+        @@ -295,6 +315,10 @@ impl Default for Options {
                      ios_version: None,
                      ios_es2_direct_present: false,
                      scale_hack: NonZeroU32::new(1).unwrap(),
         +            eagl_fill_screen: false,
         +            eagl_default_scale_1: false,
         +            skip_movies: false,
+        +            scale_hack_render_textures: false,
                      ui_scale: NonZeroU32::new(2).unwrap(),
                      analog_stick_tilt_controls: true,
                      deadzone: 0.1,
-        @@ -467,6 +484,18 @@ impl Options {
+        @@ -467,6 +491,22 @@ impl Options {
                          return Err("--screen-size= dimensions must be non-zero".to_string());
                      }
                      self.host_screen_size = Some((w, h));
@@ -347,6 +523,10 @@ jobs:
         +            self.eagl_default_scale_1 = true;
         +        } else if arg == "--no-eagl-default-scale-1" {
         +            self.eagl_default_scale_1 = false;
+        +        } else if arg == "--scale-hack-render-textures" {
+        +            self.scale_hack_render_textures = true;
+        +        } else if arg == "--no-scale-hack-render-textures" {
+        +            self.scale_hack_render_textures = false;
         +        } else if arg == "--skip-movies" {
         +            self.skip_movies = true;
         +        } else if arg == "--no-skip-movies" {
@@ -355,7 +535,7 @@ jobs:
                      self.scale_hack = value
                          .parse()
         diff --git a/touchHLE_default_options.txt b/touchHLE_default_options.txt
-        index 39f6a82..f8e9bfd 100644
+        index 39f6a82..75722f8 100644
         --- a/touchHLE_default_options.txt
         +++ b/touchHLE_default_options.txt
         @@ -142,6 +142,10 @@ com.gameloft.Shrek4Free: --landscape-left --button-to-touch=DPadDown,44,278 --bu
@@ -364,7 +544,7 @@ jobs:
          
         +# Asphalt 6
         +# Fill a 16:9 device profile (pick iPod touch 5 in the app picker settings)
-        +com.gameloft.Asphalt6: --eagl-fill-screen --eagl-default-scale-1 --skip-movies
+        +com.gameloft.Asphalt6: --eagl-fill-screen --eagl-default-scale-1 --skip-movies --scale-hack-render-textures
         +
          # Asphalt 5
          # A = Nitro, B = Brake, Start = Pause
